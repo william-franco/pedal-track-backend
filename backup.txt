@@ -1,0 +1,301 @@
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using Microsoft.OpenApi.Models;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// SQLite
+builder.Services.AddDbContext<AppDbContext>(opt =>
+    opt.UseSqlite("Data Source=pedaltrack.db"));
+
+// Swagger
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(opt =>
+{
+    opt.SwaggerDoc("v1", new OpenApiInfo { Title = "PedalTrackBackend API", Version = "v1" });
+    opt.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+    {
+        In = ParameterLocation.Header,
+        Description = "Insira o token JWT no formato: Bearer {token}",
+        Name = "Authorization",
+        Type = SecuritySchemeType.ApiKey,
+        Scheme = "Bearer"
+    });
+    opt.AddSecurityRequirement(new OpenApiSecurityRequirement
+    {
+        { new OpenApiSecurityScheme { Reference = new OpenApiReference { Type = ReferenceType.SecurityScheme, Id = "Bearer" } }, new string[] { } }
+    });
+});
+
+// CORS
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowAll", b =>
+    {
+        b.AllowAnyOrigin()
+         .AllowAnyMethod()
+         .AllowAnyHeader();
+    });
+});
+
+// Autenticação JWT
+var key = Encoding.ASCII.GetBytes("SuperSecretKeyForJwtTokenDontShare");
+builder.Services.AddAuthentication(o =>
+{
+    o.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    o.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+})
+.AddJwtBearer(o =>
+{
+    o.RequireHttpsMetadata = false;
+    o.SaveToken = true;
+    o.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuerSigningKey = true,
+        IssuerSigningKey = new SymmetricSecurityKey(key),
+        ValidateIssuer = false,
+        ValidateAudience = false,
+        ClockSkew = TimeSpan.Zero
+    };
+});
+
+builder.Services.AddAuthorization();
+
+var app = builder.Build();
+
+// ======================= PIPELINE =======================
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+app.UseCors("AllowAll");
+app.UseAuthentication();
+app.UseAuthorization();
+
+// ======================= API GROUPS =======================
+var api = app.MapGroup("/api");
+
+// ======================= AUTH (público) =======================
+var authGroup = api.MapGroup("/auth");
+
+// Register
+authGroup.MapPost("/register", async (RegisterDto dto, AppDbContext db) =>
+{
+    if (await db.Users.AnyAsync(u => u.Email == dto.Email))
+        return Results.BadRequest("Email já cadastrado.");
+
+    var user = new User
+    {
+        Name = dto.Name,
+        Email = dto.Email,
+        Password = BCrypt.Net.BCrypt.HashPassword(dto.Password),
+        CreatedAt = DateTime.UtcNow,
+        UpdatedAt = DateTime.UtcNow
+    };
+
+    db.Users.Add(user);
+    await db.SaveChangesAsync();
+
+    return Results.Ok(new { user.Id, user.Name, user.Email });
+});
+
+// Login
+authGroup.MapPost("/login", async (LoginDto dto, AppDbContext db) =>
+{
+    var user = await db.Users.FirstOrDefaultAsync(u => u.Email == dto.Email);
+    if (user == null || !BCrypt.Net.BCrypt.Verify(dto.Password, user.Password))
+        return Results.Unauthorized();
+
+    var tokenHandler = new JwtSecurityTokenHandler();
+    var tokenDescriptor = new SecurityTokenDescriptor
+    {
+        Subject = new ClaimsIdentity(new[]
+        {
+            new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+            new Claim(ClaimTypes.Email, user.Email)
+        }),
+        Expires = DateTime.UtcNow.AddHours(1),
+        SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
+    };
+    var token = tokenHandler.CreateToken(tokenDescriptor);
+    var accessToken = tokenHandler.WriteToken(token);
+
+    var refreshToken = Guid.NewGuid().ToString();
+
+    return Results.Ok(new { AccessToken = accessToken, RefreshToken = refreshToken });
+});
+
+// Refresh (simulado)
+authGroup.MapPost("/refresh", (RefreshRequestDto dto) =>
+{
+    // Implementar persistência de refreshToken se necessário
+    return Results.Ok(new { AccessToken = "NovoAccessTokenSimulado", RefreshToken = dto.RefreshToken });
+});
+
+// ======================= PROTECTED =======================
+var protectedApi = api.MapGroup("").RequireAuthorization();
+
+// Users
+var usersGroup = protectedApi.MapGroup("/users");
+usersGroup.MapGet("/", async (AppDbContext db) => await db.Users.ToListAsync());
+
+// Bikes
+var bikesGroup = protectedApi.MapGroup("/bikes");
+bikesGroup.MapGet("/", async (AppDbContext db) => await db.Bikes.ToListAsync());
+bikesGroup.MapPost("/", async (CreateBikeDto dto, ClaimsPrincipal userClaims, AppDbContext db) =>
+{
+    var userId = int.Parse(userClaims.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    var bike = new Bike { Brand = dto.Brand, Model = dto.Model, UserId = userId, CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow };
+    db.Bikes.Add(bike);
+    await db.SaveChangesAsync();
+    return Results.Ok(bike);
+});
+
+// Usage Records
+var usageGroup = protectedApi.MapGroup("/usage-records");
+usageGroup.MapGet("/", async (AppDbContext db) => await db.UsageRecords.ToListAsync());
+usageGroup.MapPost("/", async (CreateUsageRecordDto dto, AppDbContext db) =>
+{
+    var record = new UsageRecord { BikeId = dto.BikeId, KmTravelled = dto.KmTravelled, CreatedAt = DateTime.UtcNow, RecordedAt = DateTime.UtcNow };
+    db.UsageRecords.Add(record);
+    await db.SaveChangesAsync();
+    return Results.Ok(record);
+});
+
+// Rides
+var ridesGroup = protectedApi.MapGroup("/rides");
+ridesGroup.MapGet("/", async (AppDbContext db) => await db.Rides.ToListAsync());
+ridesGroup.MapPost("/", async (CreateRideDto dto, ClaimsPrincipal userClaims, AppDbContext db) =>
+{
+    var userId = int.Parse(userClaims.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    var ride = new Ride { UserId = userId, DistanceKm = dto.DistanceKm, Conditions = dto.Conditions, CreatedAt = DateTime.UtcNow };
+    db.Rides.Add(ride);
+    await db.SaveChangesAsync();
+    return Results.Ok(ride);
+});
+
+// Maintenance Alerts
+var alertsGroup = protectedApi.MapGroup("/maintenance-alerts");
+alertsGroup.MapGet("/", async (AppDbContext db) => await db.MaintenanceAlerts.ToListAsync());
+alertsGroup.MapPost("/", async (CreateMaintenanceAlertDto dto, AppDbContext db) =>
+{
+    var alert = new MaintenanceAlert { BikeId = dto.BikeId, Type = dto.Type, ThresholdValue = dto.ThresholdValue, CreatedAt = DateTime.UtcNow };
+    db.MaintenanceAlerts.Add(alert);
+    await db.SaveChangesAsync();
+    return Results.Ok(alert);
+});
+
+// Maintenance Checklist
+var checklistGroup = protectedApi.MapGroup("/maintenance-checklist");
+checklistGroup.MapGet("/", async (AppDbContext db) => await db.MaintenanceChecklists.ToListAsync());
+checklistGroup.MapPost("/", async (CreateMaintenanceChecklistDto dto, AppDbContext db) =>
+{
+    var checklist = new MaintenanceChecklist { BikeId = dto.BikeId, Item = dto.Item, CreatedAt = DateTime.UtcNow };
+    db.MaintenanceChecklists.Add(checklist);
+    await db.SaveChangesAsync();
+    return Results.Ok(checklist);
+});
+
+// ======================= RUN =======================
+app.Run();
+
+// ======================= MODELS =======================
+public class User
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = "";
+    public string Email { get; set; } = "";
+    public string Password { get; set; } = "";
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+
+    public ICollection<Bike> Bikes { get; set; } = new List<Bike>();
+    public ICollection<Ride> Rides { get; set; } = new List<Ride>();
+}
+
+public class Bike
+{
+    public int Id { get; set; }
+    public int UserId { get; set; }
+    public User? User { get; set; }
+    public string Brand { get; set; } = "";
+    public string Model { get; set; } = "";
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+
+    public ICollection<UsageRecord> UsageRecords { get; set; } = new List<UsageRecord>();
+    public ICollection<MaintenanceAlert> MaintenanceAlerts { get; set; } = new List<MaintenanceAlert>();
+    public ICollection<MaintenanceChecklist> MaintenanceChecklist { get; set; } = new List<MaintenanceChecklist>();
+}
+
+public class UsageRecord
+{
+    public int Id { get; set; }
+    public int BikeId { get; set; }
+    public Bike? Bike { get; set; }
+    public float KmTravelled { get; set; }
+    public DateTime RecordedAt { get; set; } = DateTime.UtcNow;
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
+
+public class Ride
+{
+    public int Id { get; set; }
+    public int UserId { get; set; }
+    public User? User { get; set; }
+    public float DistanceKm { get; set; }
+    public string Conditions { get; set; } = "";
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
+
+public class MaintenanceAlert
+{
+    public int Id { get; set; }
+    public int BikeId { get; set; }
+    public Bike? Bike { get; set; }
+    public string Type { get; set; } = "";
+    public float ThresholdValue { get; set; }
+    public DateTime? AlertTriggeredAt { get; set; }
+    public string Status { get; set; } = "pendente";
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
+
+public class MaintenanceChecklist
+{
+    public int Id { get; set; }
+    public int BikeId { get; set; }
+    public Bike? Bike { get; set; }
+    public string Item { get; set; } = "";
+    public string Status { get; set; } = "pendente";
+    public DateTime? CheckedAt { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
+
+// ======================= DTOs =======================
+public record RegisterDto(string Name, string Email, string Password);
+public record LoginDto(string Email, string Password);
+public record RefreshRequestDto(string RefreshToken);
+public record CreateBikeDto(string Brand, string Model);
+public record CreateUsageRecordDto(int BikeId, float KmTravelled);
+public record CreateRideDto(float DistanceKm, string Conditions);
+public record CreateMaintenanceAlertDto(int BikeId, string Type, float ThresholdValue);
+public record CreateMaintenanceChecklistDto(int BikeId, string Item);
+
+// ======================= DB CONTEXT =======================
+public class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+
+    public DbSet<User> Users => Set<User>();
+    public DbSet<Bike> Bikes => Set<Bike>();
+    public DbSet<UsageRecord> UsageRecords => Set<UsageRecord>();
+    public DbSet<Ride> Rides => Set<Ride>();
+    public DbSet<MaintenanceAlert> MaintenanceAlerts => Set<MaintenanceAlert>();
+    public DbSet<MaintenanceChecklist> MaintenanceChecklists => Set<MaintenanceChecklist>();
+}
